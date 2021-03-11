@@ -6,6 +6,7 @@ from abc import ABCMeta, abstractmethod
 import inject
 import paho.mqtt.client as mqtt
 import rospy
+import threading
 
 from .util import lookup_object, extract_values, populate_instance
 from threading  import Condition
@@ -59,37 +60,58 @@ class DynamicBridgeServer(Bridge):
         self._mqtt_client.subscribe(self._register_service_topic, qos=2)
         self._mqtt_client.message_callback_add(self._register_service_topic, self._register_service)
         self._bridges = set([])
+        self._service_requests = []
+        self._lock = Condition()
+        self._service_thr = threading.Thread(target=self._service_loop)
+        self._service_thr.start()
         rospy.loginfo('DynamicBridgeServer started on control topic %s' % control_topic)
 
     def _callback_mqtt_service(self, client, userdata, mqtt_msg):
         rospy.logdebug("MQTT service call received from {}".format(mqtt_msg.topic))
         msg_dict = self._deserialize(mqtt_msg.payload)
-        service_type = lookup_object(msg_dict['type'])
-        request_type = lookup_object(msg_dict['type'] + 'Request')
-        # create request object
-        request = request_type()
-        # and populate it
-        populate_instance(msg_dict['args'], request)
-        response_type = lookup_object(msg_dict['type'] + 'Response')
+        with self._lock:
+            self._service_requests.append(msg_dict)
+            self._lock.notifyAll()
 
-        # create empty response object
-        response = response_type()
-        msg_dict['op'] = 'response'
-        try:
-            rospy.logdebug('waiting for service %s' % msg_dict['service'])
-            rospy.wait_for_service(msg_dict['service'], 1)
+    def _service_loop(self):
 
-            service = rospy.ServiceProxy(msg_dict['service'], service_type)
-            response = service.call(request)
-            msg_dict['response'] = extract_values(response)
-        except Exception:
-            rospy.logerr("Service %s doesn't exist" % msg_dict['service'])
-            msg_dict['response'] = None
-        finally:
-            payload = bytearray(self._serialize(msg_dict))
-            self._mqtt_client.publish(
-                topic=msg_dict['response_topic'], payload=payload,
-                qos=2, retain=False)
+        # wait for a response
+        while not rospy.is_shutdown():
+            try:
+                with self._lock:
+                    req_msg = self._service_requests.pop()
+            except IndexError:
+                pass
+            else:
+                service_type = lookup_object(req_msg['type'])
+                request_type = lookup_object(req_msg['type'] + 'Request')
+                # create request object
+                request = request_type()
+                # and populate it
+                populate_instance(req_msg['args'], request)
+                response_type = lookup_object(req_msg['type'] + 'Response')
+
+                # create empty response object
+                response = response_type()
+                req_msg['op'] = 'response'
+                try:
+                    rospy.logdebug('waiting for service %s' % req_msg['service'])
+                    rospy.wait_for_service(req_msg['service'], 1)
+
+                    service = rospy.ServiceProxy(req_msg['service'], service_type)
+                    response = service.call(request)
+                    req_msg['response'] = extract_values(response)
+                except Exception:
+                    rospy.logerr("Service %s doesn't exist" % req_msg['service'])
+                    req_msg['response'] = None
+                finally:
+                    payload = bytearray(self._serialize(req_msg))
+                    self._mqtt_client.publish(
+                        topic=req_msg['response_topic'], payload=payload,
+                        qos=2, retain=False)
+
+            with self._lock:
+                self._lock.wait(1)  # check for shutdown every 1 second
 
     def _register_service(self, client, userdata, mqtt_msg):
 
@@ -375,6 +397,7 @@ class RemoteService(Bridge):
         resp = responses[request_id]
         del responses[request_id]
         self._mqtt_client.unsubscribe(request_message['response_topic'])
+        self._mqtt_client.message_callback_remove(request_message['response_topic'])
 
         # assemble response object
         response_type = lookup_object(self._srv_type_name+"Response")
